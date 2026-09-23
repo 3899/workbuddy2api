@@ -20,11 +20,25 @@ cd "$(dirname "$0")"
 AUTH_DIR="./auths"
 CONTAINER="workbuddy2api"
 
-mkdir -p "$AUTH_DIR"
+mkdir -p "$AUTH_DIR" 2>/dev/null || true
+# ─── auths/ 可写性预检（issue #160）：chown -R 10001 后 host 侧 uid 无写权限，
+#      此时走完整 OAuth 再在落盘处失败 = 白跑一次浏览器授权。OAuth 启动前 fail-fast。───
+if ! [[ -w "$AUTH_DIR" ]]; then
+    echo "❌ 无法写入 $AUTH_DIR（auths/ 已归属容器 uid 10001？）" >&2
+    echo "    请在容器内登录（无需 chown 回滚，属主自动正确）：" >&2
+    echo "    docker compose exec -it wb2api bash -c './login.sh' && docker compose restart wb2api" >&2
+    exit 1
+fi
 
-# login 工具：不存在才编译（源码改动后手动 go build -o login ./cmd/login）
+# login 工具：缺失或构建输入（*.go 与 go.mod/go.sum）比它新时重编——realm 路由
+# 逻辑在 login 二进制里，过期的二进制会把 global 凭证打向 CN 端点，症状与
+# 「token 过期」无法区分。
 LOGIN_BIN="./login"
-if [[ ! -x "$LOGIN_BIN" ]]; then
+if [[ ! -x "$LOGIN_BIN" ]] || find . \( -name '*.go' -o -name 'go.mod' -o -name 'go.sum' \) -newer "$LOGIN_BIN" -print -quit | grep -q .; then
+    if ! command -v go >/dev/null 2>&1; then
+        echo "需要 go 构建 login（或镜像内置 /app/login）" >&2
+        exit 1
+    fi
     go build -o "$LOGIN_BIN" ./cmd/login
 fi
 
@@ -186,8 +200,11 @@ auth = {
 auth_file = os.environ["WB2A_LOGIN_AUTH_FILE"]
 # 容器内 app 运行 uid（Dockerfile USER 10001）：属主不匹配会导致账号数为 0（issue #108）
 CONTAINER_UID = 10001
-fd, tmp_file = tempfile.mkstemp(prefix=".workbuddy-auth-", dir=os.path.dirname(auth_file) or ".")
+# mkstemp 必须在 try 块内（issue #160）：目录不可写时它第一个抛 PermissionError，
+# 放在 try 外会使下方 207-210 的失败指引成为死代码（裸 traceback 直接冒出）。
+tmp_file = None
 try:
+    fd, tmp_file = tempfile.mkstemp(prefix=".workbuddy-auth-", dir=os.path.dirname(auth_file) or ".")
     with os.fdopen(fd, "w") as f:
         json.dump(auth, f, indent=1)
     os.replace(tmp_file, auth_file)
@@ -198,10 +215,11 @@ try:
         print(f"    请执行：chown -R {CONTAINER_UID}:{CONTAINER_UID} ./auths")
         print(f"    或在容器内登录（属主自动正确）：docker compose exec -it wb2api bash -c './login.sh'\n")
 except Exception:
-    try:
-        os.unlink(tmp_file)
-    except FileNotFoundError:
-        pass
+    if tmp_file is not None:
+        try:
+            os.unlink(tmp_file)
+        except FileNotFoundError:
+            pass
     # 写入失败诊断：目录不可写时给出具体指引
     auth_dir = os.path.dirname(auth_file) or "."
     if not os.access(auth_dir, os.W_OK):
